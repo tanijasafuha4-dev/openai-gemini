@@ -357,8 +357,7 @@ const transformFnResponse = ({ content, tool_call_id }, parts) => {
   try {
     response = JSON.parse(content);
   } catch (err) {
-    console.error("Error parsing function response content:", err);
-    throw new HttpError("Invalid function response: " + content, 400);
+    response = { result: content };
   }
   if (typeof response !== "object" || response === null || Array.isArray(response)) {
     response = { result: response };
@@ -373,12 +372,22 @@ const transformFnResponse = ({ content, tool_call_id }, parts) => {
   if (parts[i]) {
     throw new HttpError("Duplicated tool_call_id: " + tool_call_id, 400);
   }
+  
+  let realId = tool_call_id;
+  let thoughtSignature = undefined;
+  if (realId && realId.includes("___")) {
+    const splits = realId.split("___");
+    realId = splits[0];
+    try { thoughtSignature = decodeURIComponent(splits[1]); } catch(e) {}
+  }
+  
   parts[i] = {
     functionResponse: {
-      id: tool_call_id.startsWith("call_") ? null : tool_call_id,
+      id: realId, // 关键修复：不再将 id 替换为 null
       name,
       response,
-    }
+    },
+    thoughtSignature: thoughtSignature, // 关键修复：按照谷歌最新文档，将签名一并附加到响应返回区块
   };
 };
 
@@ -392,17 +401,25 @@ const transformFnCalls = ({ tool_calls }) => {
     try {
       args = JSON.parse(argstr);
     } catch (err) {
-      console.error("Error parsing function arguments:", err);
       throw new HttpError("Invalid function arguments: " + argstr, 400);
     }
+    
+    let realId = id;
+    let thoughtSignature = extra_content?.google?.thought_signature;
+    if (id && id.includes("___")) {
+      const splits = id.split("___");
+      realId = splits[0];
+      try { thoughtSignature = decodeURIComponent(splits[1]); } catch(e) {}
+    }
+    
     calls[id] = {i, name};
     return {
       functionCall: {
-        id: id.startsWith("call_") ? null : id,
+        id: realId, // 关键修复：不再将 id 替换为 null
         name,
         args,
       },
-      thoughtSignature: extra_content?.google?.thought_signature,
+      thoughtSignature: thoughtSignature,
     };
   });
   parts.calls = calls;
@@ -465,13 +482,15 @@ const transformMessages = async (messages) => {
         system_instruction = { parts: await transformMsg(item) };
         continue;
       case "tool":
+      case "function": 
         // eslint-disable-next-line no-case-declarations
         let { role, parts } = contents[contents.length - 1] ?? {};
-        if (role !== "function") {
+        if (role !== "user" || !parts.isToolResponseGroup) {
           const calls = parts?.calls;
           parts = []; parts.calls = calls;
+          parts.isToolResponseGroup = true; 
           contents.push({
-            role: "function", // ignored
+            role: "user", // 谷歌新规：工具的返回结果必须使用 user 角色
             parts
           });
         }
@@ -499,12 +518,33 @@ const transformMessages = async (messages) => {
   return { system_instruction, contents };
 };
 
+// 新增的参数清理函数
+function cleanGeminiTools(obj) {
+  if (Array.isArray(obj)) {
+    obj.forEach(cleanGeminiTools);
+  } else if (obj !== null && typeof obj === 'object') {
+    delete obj.const;
+    delete obj.exclusiveMinimum;
+    delete obj.exclusiveMaximum;
+    delete obj.propertyNames;
+    delete obj.additionalProperties;
+
+    for (let key in obj) {
+      cleanGeminiTools(obj[key]);
+    }
+  }
+}
+
+// 替换后的 transformTools 函数
 const transformTools = (req) => {
   let tools, tool_config;
   if (req.tools) {
     const funcs = req.tools.filter(tool => tool.type === "function");
     funcs.forEach(adjustSchema);
     tools = [{ function_declarations: funcs.map(schema => schema.function) }];
+    
+    // 调用清理函数剔除不兼容字段
+    cleanGeminiTools(tools); 
   }
   if (req.tool_choice) {
     const allowed_function_names = req.tool_choice?.type === "function" ? [ req.tool_choice?.function?.name ] : undefined;
@@ -548,17 +588,38 @@ function transformCandidates (key, cand) {
   for (const part of cand.content?.parts ?? []) {
     if (part.functionCall) {
       const fc = part.functionCall;
-      message.tool_calls ??= [];
-      const thought_signature = fc.thoughtSignature;
-      message.tool_calls.push({
-        id: fc.id ?? "call_" + generateId(),
-        type: "function",
-        function: {
-          name: fc.name,
-          arguments: JSON.stringify(fc.args),
-        },
-        extra_content: thought_signature ? {google: { thought_signature }} : undefined,
-      });
+message.tool_calls ??= [];
+
+// Google Gemini 3:
+// thoughtSignature 位于 Part 上，与 functionCall 同级
+const thought_signature =
+  part.thoughtSignature ?? fc.thoughtSignature;
+
+let callId = fc.id ?? "call_" + generateId();
+
+if (thought_signature) {
+  callId += "___" + encodeURIComponent(thought_signature);
+}
+
+const toolCall = {
+  id: callId,
+  type: "function",
+  function: {
+    name: fc.name,
+    arguments: JSON.stringify(fc.args),
+  },
+};
+
+if (thought_signature) {
+  toolCall.extra_content = {
+    google: {
+      thought_signature,
+    },
+  };
+}
+
+message.tool_calls.push(toolCall);
+
     } else if (typeof part.text === "string") {
       const len = message.content.length;
       if (part.thought !== this.isThinking) {
